@@ -1,33 +1,25 @@
 ####################################################################################################
 # First author: Bernhard Ulm
 # Second author: Dimitrij Tschodu
-# Code status: Still implementing :) 
 ####################################################################################################
-
-
-
-
+##### Load libraries ###############################################################################
 library("tidyr")
 library("dplyr")
 library("purrr")
 library("broom")
 library("ipred")
-
-#### Global constants ##############################################################################
+library("pec")
+#### Define global constants #######################################################################
 
 stime = 120 # survival time in months
 
-
-
-#### Helper functions ##############################################################################
-gl = compose(get, load)
-
-
 #### Load METABRIC data ############################################################################
-# You have get access in order to download METABRIC (MB) data from the official  website.
-# All results in the paper can be replicated using the training and test sets:
-# patient_ids* provide the patients ids we used.
-####################################################################################################
+# You have to get access in order to download METABRIC (MB) data from the official  website.
+# Main results in the paper can be replicated using the training and test sets:
+# patient_ids* provides the patients ids we used.
+
+gl = compose(get, load) # syntactic sugar
+
 X = gl(file= "Metabric.data")
 patient_ids.training = gl(file = "patient_ids.training")
 patient_ids.test =     gl(file = "patient_ids.test")
@@ -50,23 +42,16 @@ X.test =  X %>%
 
 randomSignatures = gl(file = "randomSignatures")
 
-#### Get Cox regression on training data ###########################################################
-# These are lists of gene selections for each signature
-selections = gl(file = "selections")
-
-### Helper functions 
-
+#### Define functions ##############################################################################
 #Select variables in training and test sets for each signature
 sv = function(df, selection) {return(df %>% select(Stime, Status, selection))}
-
-# Fits Cox model for each signature
+# Fit Cox model for each signature
 signature_model = function(df){
   lhs = "Surv(Stime, Status)"
   rhs = paste(names(df[3:length(df)]), collapse =  "+")
   form = as.formula(paste(lhs, "~", rhs))
   coxph(form,  data = df, x=T, y=T)
 }
-
 auc = function(df, model_prediction){
   #Compute AUC over time
   auc_i = function(time_i){
@@ -79,22 +64,17 @@ auc = function(df, model_prediction){
   }
   map(sort(df$Stime[df$Status==1]), auc_i) #time points up to the stime
 }
-
-
 dt_train = function(df, cox_prediction){
   # Train Decision Trees
   tmp = cbind(df, cox_prediction)
   ctree(Surv(Stime, Status) ~ cox_prediction, data = tmp)
 }
-
 dt_predict = function(df, dt_model, cox_prediction){
   # Predict using Decision Trees
   df$cox_prediction = cox_prediction
   predict(dt_model, type ="node", newdata = df)
 }
-
 c_index = function(model){return(model$concordance[[6]])}
-
 r2 = function(model){
   # Nagelkerkes version of R2
   m = model
@@ -104,7 +84,6 @@ r2 = function(model){
   rsq     <-  (1 - exp(2*(l0-lm)/n)) / (1 - exp(2*(l0)/n)) 
   return(rsq)  
 }
-
 logrank = function(model){summary(model)$sctest[[1]]}
 surv_probs = function(model, df){as.numeric(predictSurvProb(model, df, times = stime ))}
 brier_score = function(df, surv_probs){sbrier(Surv(df$Stime, df$Status), surv_probs, btime=stime)[[1]]}
@@ -113,7 +92,30 @@ sss = function(bs){
   bs.avg = mean(unlist(randomSignatures$BS)) 
   ((bs.avg - bs)/bs.avg)
 }
+iauc.compute = function(signature){
+  # Computes the integrated AUC for each signature and returns corresponding p-values, iauc1, iauc2
+  # as they are used in the "iauc.comp" function from the "survcomp" package.
+  auc = tmp$auc
+  test_data = tmp$test_data
+  
+  inds=1:length(tmp$signature)
+  i = inds[tmp$signature==signature] # index of signature which the iauc is computed for
+  d = size(test_data)[2]-1 #dimension without the first iauc
+  auc.1 = unlist(auc[i])
+  auc.other = auc[-i] 
+  time = sort(test_data[[i]]$Stime[test_data[[i]]$Status==1]) 
+  auc.integrate = partial(iauc.comp, auc1 = auc.1, time = time) #syntactic sugar    
+  IAUCs = vector("list", d) 
+  for (a in seq_along(auc.other)) {IAUCs[[a]] = auc.integrate(unlist(auc.other[[a]]))}
+  IAUCs = data.frame(matrix(unlist(IAUCs), nrow=length(IAUCs), byrow=TRUE))
+  colnames(IAUCs) = c("pvalue", "iauc1", "iauc2")
+  rownames(IAUCs) = tmp$signature[-i]
+  return(IAUCs)
+}
 
+### Do analysis ####################################################################################
+# Load lists of gene selections for each signature
+selections = gl(file = "selections")
 # Main dataframe with everything inside: data for each signature, Cox models, everything you want.
 df = 
   tibble(signature = c("Hybrid", "EndoPredict", "OncotypeDx", "NPI", "Random", "RandomNPI"),
@@ -129,131 +131,18 @@ df =
                                   tibble(sv(X.test, selections$otdx)),
                                   tibble(sv(X.test, "Nottingham.prognostic.index")),
                                   tibble(sv(X.test, selections$random)),
-                                  tibble(sv(X.test, selections$randomnpi))) 
-  ) %>%
-  mutate(model = map(training_data, signature_model)) %>%
-  mutate(cox_prediction = map2(model, test_data, predict)) %>%
-  mutate(auc = map2(test_data, cox_prediction,  roc))
-
-tmp = df %>%
-  mutate(
-    model = map(training_data, signature_model),
-    cox_prediction_on_training = map2(model, training_data, predict),
-    dtree_model = map2(training_data, cox_prediction_on_training, dt_train),
-    dtree_preds   = pmap(list(test_data, dtree_model, cox_prediction), dt_predict),
-    Cindex = map(model, c_index),
-    R2 = map(model, r2),
-    LogRank = map(model, logrank),
-    survProbs = map2(model, test_data, surv_probs),
-    brierScore = map2(test_data, survProbs, brier_score),
-    SSS =map(brierScore, sss)
-  )
-
-iauc.comp(tmp$auc[[1]])
-unlist(tmp$auc[[1]])
-
-
-
-
-
-#### Plots ######################################################################################### 
-
-
-R = data.frame(Cindex = unlist(randomSignatures$Cindex),
-               R2 = unlist(randomSignatures$R2),
-               LR = unlist(randomSignatures$LR),
-               BS = unlist(randomSignatures$BS))
-               
-
-P = pal_lancet("lanonc", alpha = 1)(6)
-Ptable = pal_lancet("lanonc", alpha = 0.5)(6)
-FONT = "Helvitica"
-FONTSIZE = 16
-ps = 2.5
-ls = 1.0
-
-results = t.test(R$Cindex,conf.level = 0.95)
-low =  round(results$conf.int[1], 4)
-high = round(results$conf.int[2], 4)
-mean = round(results$estimate[[1]], 4)
-
-p.cindex = ggplot(R, aes(x=Cindex)) + geom_histogram(binwidth = 0.006, color="black", fill=P[6]) +
-  theme_tufte() +
-  theme_linedraw() +
-  ylab("Counts") +
-  xlab("C-index") +
-  theme(text = element_text(size = FONTSIZE, family=FONT)) + 
-  annotate("text", x = 0.66, y = 11, label = paste("Mean = ", mean, "\n", 
-                                                   "95% CI: ", low, "-", high), 
-           size=6 )+
-  annotate("rect", xmin = low, xmax = high, ymin = 0, ymax = 18,alpha = .2)
-
-
-results = t.test(R$BS,conf.level = 0.95)
-low =  round(results$conf.int[1], 4)
-high = round(results$conf.int[2], 4)
-mean = round(results$estimate[[1]], 4)
-
-p.bs = ggplot(R, aes(x=BS)) + geom_histogram(binwidth = 0.0025, color="black", fill=P[6]) +
-  theme_tufte() +
-  theme_linedraw() +
-  ylab("Counts") +
-  xlab("Brier Score") +
-  theme(text = element_text(size = FONTSIZE, family=FONT)) + 
-  annotate("text", x = 0.18, y = 11, label = paste("Mean = ", mean, "\n", 
-                                                   "95% CI: ", low, "-", high), 
-           size=6 )+
-  annotate("rect", xmin = low, xmax = high, ymin = 0, ymax = 17,alpha = .2)
-
-
-results = t.test(R$R2,conf.level = 0.95)
-low =  round(results$conf.int[1], 4)
-high = round(results$conf.int[2], 4)
-mean = round(results$estimate[[1]], 4)
-
-p.r2 = ggplot(R, aes(x=R2)) + geom_histogram(binwidth = 0.005, color="black", fill=P[6]) +
-  theme_tufte() +
-  theme_linedraw() +
-  ylab("Counts") +
-  xlab("R2") +
-  theme(text = element_text(size = FONTSIZE, family=FONT)) + 
-  annotate("text", x = 0.1, y = 11, label = paste("Mean = ", mean, "\n", 
-                                                   "95% CI: ", low, "-", high), 
-           size=6 )+
-  annotate("rect", xmin = low, xmax = high, ymin = 0, ymax = 16,alpha = .2)
-
-
-results = t.test(R$LR,conf.level = 0.95)
-low =  round(results$conf.int[1], 1)
-high = round(results$conf.int[2], 1)
-mean = round(results$estimate[[1]], 1)
-
-p.lr = ggplot(R, aes(x=LR)) + geom_histogram(binwidth = 4, color="black", fill=P[6]) +
-  theme_tufte() +
-  theme_linedraw() +
-  ylab("Counts") +
-  xlab("LogRank statistic") +
-  theme(text = element_text(size = FONTSIZE, family=FONT)) + 
-  annotate("text", x = 75, y = 11, label = paste("Mean = ", mean, "\n", 
-                                                   "95% CI: ", low, "-", high), 
-           size=6 )+
-  annotate("rect", xmin = low, xmax = high, ymin = 0, ymax = 16,alpha = .2)
-
-
-grid.arrange(p.cindex, p.r2, p.bs, p.lr, nrow = 2)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+                                  tibble(sv(X.test, selections$randomnpi)))) %>%
+              mutate(model = map(training_data, signature_model),
+                     cox_prediction = map2(model, test_data, predict),
+                     cox_prediction_on_training = map2(model, training_data, predict),
+                     auc = map2(test_data, cox_prediction,  auc),
+                     dtree_model = map2(training_data, cox_prediction_on_training, dt_train),
+                     dtree_preds   = pmap(list(test_data, dtree_model, cox_prediction), dt_predict),
+                     Cindex = map(model, c_index),
+                     R2 = map(model, r2),
+                     LogRank = map(model, logrank),
+                     survProbs = map2(model, test_data, surv_probs),
+                     brierScore = map2(test_data, survProbs, brier_score),
+                     SSS =map(brierScore, sss),
+                     IAUCs = map(signature, iauc.compute)
+                    )
